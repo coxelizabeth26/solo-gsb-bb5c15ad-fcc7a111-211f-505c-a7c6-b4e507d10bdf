@@ -7,8 +7,11 @@ JSON 清单，选择项目许可策略后，系统解析完整**传递依赖图*
 * **结论**：`冲突(deny)` / `待审查(review)` / `兼容(allow)`；
 * **触发规则**：矩阵规则（`MATRIX`）或策略规则（`POLICY_DENY` / `POLICY_ALLOW` / `UNKNOWN_LICENSE`）及触发的许可证；
 * **最短依赖路径**：从直接依赖（根）到冲突包的最短路径（BFS）与引入深度；
-* **例外确认**：在页面上对任意冲突包填写理由并"确认例外"，结果实时重新计算，可随时撤销；
-* **JSON 报告导出**：一键下载完整审查报告。
+* **多制品审查**：一个清单可声明多个 `distributions` 制品（各自名称、项目许可证、直接依赖），
+  在同一张依赖图上分别遍历判定，总览按最严重结论聚合并列出受影响制品；
+* **例外确认**：在页面上对任意冲突包填写理由并"确认例外"（多制品模式可按制品分别确认），
+  结果实时重新计算，可随时撤销；
+* **JSON 报告导出**：一键下载完整审查报告（多制品时含分制品明细）。
 
 > ⚠️ 内置矩阵覆盖 MIT / Apache-2.0 / BSD / ISC / MPL-2.0 / LGPL-2.1 / LGPL-3.0 /
 > GPL-2.0 / GPL-3.0 / AGPL-3.0 / Proprietary 等常见许可证（含 GPL 单向兼容、
@@ -117,6 +120,7 @@ pytest -q
 | `project.name` / `project.version` | 否 | 项目元信息 |
 | `project_license` | 否 | 项目许可证（派生作品分发许可证），缺省取策略默认值 |
 | `direct_dependencies` | 否 | 显式直接依赖（图的根）；缺省时以"入度为 0 的包"为根 |
+| `distributions` | 否 | 多制品数组（见下）；提供后进入多制品审查模式 |
 
 解析特性：
 
@@ -130,6 +134,56 @@ pytest -q
 
 * `A OR B`：被许可方可二选一，按**最兼容**分支判定；
 * `A AND B`：条款同时适用，按**最严格**分支判定。
+
+---
+
+## 多制品审查（distributions）
+
+一个仓库可能同时构建多个对外分发的制品（SDK、CLI、服务端……），它们共享同一张依赖图，
+但**根集合与项目许可证不同**。清单可提供可选的 `distributions` 数组（参考
+[`examples/manifest.multi.example.json`](examples/manifest.multi.example.json)）：
+
+```json
+{
+  "project": { "name": "example-monorepo", "version": "3.0.0" },
+  "packages": [ /* 所有制品共享的完整依赖图 */ ],
+  "distributions": [
+    { "name": "sdk-mpl",      "project_license": "MPL-2.0",  "direct_dependencies": ["sdk-main"] },
+    { "name": "cli-gpl3",     "project_license": "GPL-3.0",  "direct_dependencies": ["cli-main"] },
+    { "name": "service-agpl", "project_license": "AGPL-3.0", "direct_dependencies": ["service-main"] }
+  ]
+}
+```
+
+| `distributions[]` 字段 | 必填 | 说明 |
+| --- | --- | --- |
+| `name` | 是 | 制品唯一名称，重复会报错 |
+| `project_license` | 是* | 该制品的项目许可证；可省略并回退到顶层 `project_license` 或策略默认值，仍需在所选策略允许范围内 |
+| `direct_dependencies` | 是 | 非空字符串数组，该制品的遍历根（`名字` 或 `名字@版本`） |
+
+语义：
+
+* **同一依赖图、分别遍历**：后端只构建一次图，然后从每个制品自己的根分别执行 BFS 最短路径遍历，
+  按**该制品的项目许可证**与所选策略判定；每个制品只统计从其根**可达**的包；
+* **悬空根定位到制品**：某个制品的根引用无法解析时，记录在该制品的 `unresolved_roots`，
+  同时进入全局 `unresolved_refs`，页面顶部明确标出是哪个制品的哪个根悬空；
+* **公共包独立结论**：被多个制品共享的包，保留每个制品下独立的最短路径、结论、触发规则与
+  例外状态（例如同一 LGPL 包在 MPL 制品下"待审查"、在 AGPL 制品下"兼容"）；
+* **总览聚合**：`overview` 对每个包按**最严重结论**（deny > review > exception > allow）聚合，
+  并在 `affected` 中列出各受影响制品的结论、规则、深度与路径；对所有制品都不可达的包
+  （孤立环 / 未被引用）列入 `unreachable_packages`，不计入任何制品统计；
+* **例外按规则生效**：在某制品下确认例外时，保存该制品当时的触发规则（`rule`）与制品名，
+  重新计算时**只覆盖同 `package_id` 且规则相同**的制品结论——规则不同的制品（许可证不同）
+  不受影响，规则相同的其他制品结论一并标记为例外；
+* 多制品模式下不再支持统一覆盖"项目许可证"（每个制品以自己的许可证为准）；
+* **未提供 `distributions` 的旧清单**：响应 `mode` 为 `single`，结构与行为与旧版完全一致。
+
+页面在结果区提供"总览 / 各制品"切换标签：总览按最严重结论列出冲突与每个受影响制品的路径，
+可直接对具体制品确认例外；制品标签只展示该制品可达的包及其制品内最短路径。
+
+> 注意：各策略限定了不同的项目许可证范围（如 copyleft 策略只接受 GPL/AGPL/LGPL/MPL），
+> 多制品清单中**所有制品**的 `project_license` 都必须落在所选策略的允许范围内，
+> 否则上传/切换策略时返回 400。
 
 ---
 
@@ -161,16 +215,18 @@ pytest -q
 | `GET` | `/api/projects` | 项目列表 |
 | `GET` | `/api/projects/{id}` | 获取项目最新分析结果（可带 `?policy_key=&project_license=`） |
 | `POST` | `/api/projects/{id}/reanalyze` | 切换策略/项目许可证后重新计算 |
-| `POST` | `/api/projects/{id}/exceptions/{package_id}` | 确认例外（body：`{"note": "理由"}`），自动重新计算 |
-| `DELETE` | `/api/projects/{id}/exceptions/{package_id}` | 撤销例外，自动重新计算 |
+| `POST` | `/api/projects/{id}/exceptions/{package_id}` | 确认例外（body：`{"note": "理由", "distribution": "制品名"}`），自动重新计算。多制品模式必须带 `distribution`，后端按该制品当前触发规则保存 |
+| `DELETE` | `/api/projects/{id}/exceptions/{package_id}` | 撤销例外，自动重新计算；多制品模式需带查询参数 `?distribution=制品名` |
 | `DELETE` | `/api/projects/{id}` | 删除项目 |
-| `GET` | `/api/projects/{id}/export` | 下载 JSON 报告（`license-report-{id}.json`） |
+| `GET` | `/api/projects/{id}/export` | 下载 JSON 报告（`license-report-{id}.json`），多制品时含 `distributions` 分制品明细与总览 |
 | `GET` | `/api/policies` · `/api/licenses` · `/api/health` | 元数据 |
 
 `package_id` 即 `name@version`（URL 中需编码，前端已处理）。
 
-导出报告（`licensegate-report/v1`）包含：项目与策略信息、统计摘要、每个包的结论 /
-触发规则 / 最短路径 / 例外信息、冲突列表、循环依赖、悬空引用以及原始清单。
+导出报告（`licensegate-report/v1`，含 `mode: single|multi`）包含：项目与策略信息、统计摘要、
+每个包的结论 / 触发规则 / 最短路径 / 例外信息、冲突列表、循环依赖、悬空引用以及原始清单。
+多制品报告额外包含 `distributions`（每个制品独立的摘要、包结论、冲突、根、悬空根）与
+总览 `packages[].affected`（每个受影响制品的结论、规则、路径）。
 
 ---
 
@@ -180,13 +236,13 @@ pytest -q
 .
 ├── app/
 │   ├── main.py        # FastAPI 路由与静态页
-│   ├── analyzer.py    # 清单解析、依赖图、BFS 最短路径、环检测、冲突分析
+│   ├── analyzer.py    # 清单解析、依赖图、BFS 最短路径、环检测、单/多制品冲突分析
 │   ├── licenses.py    # SPDX 规范化、表达式解析、兼容性矩阵
 │   ├── policies.py    # 四种许可策略与判定叠加规则
-│   └── db.py          # SQLite 持久化（项目 + 例外）
-├── static/index.html  # 单页前端（原生 JS，无构建步骤）
-├── examples/          # 示例清单
-├── tests/             # 29 个单元/接口测试
+│   └── db.py          # SQLite 持久化（项目 + 按 (包,规则) 维度的例外，含旧库迁移）
+├── static/index.html  # 单页前端（原生 JS，无构建步骤，含制品切换与总览）
+├── examples/          # 示例清单（manifest.example.json 单制品 / manifest.multi.example.json 多制品）
+├── tests/             # 53 个单元/接口测试（含多制品引擎与端到端用例）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt
