@@ -161,3 +161,150 @@ def test_project_crud():
     assert client.get("/api/projects/99999").status_code == 404
     assert client.delete(f"/api/projects/{pid}").status_code == 200
     assert client.get(f"/api/projects/{pid}").status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# 多制品（distributions）端到端
+# ---------------------------------------------------------------------------
+
+
+MULTI_MANIFEST = {
+    "project": {"name": "multi-api", "version": "2.0"},
+    "distributions": [
+        {"name": "gpl3-cli", "project_license": "GPL-3.0",
+         "direct_dependencies": ["cli-main"]},
+        {"name": "gpl2-daemon", "project_license": "GPL-2.0",
+         "direct_dependencies": ["server", "ghost-artifact@3"]},
+    ],
+    "packages": [
+        {"name": "cli-main", "version": "1", "license": "GPL-3.0",
+         "dependencies": ["shared"]},
+        {"name": "server", "version": "1", "license": "GPL-2.0",
+         "dependencies": ["shared"]},
+        {"name": "shared", "version": "1", "license": "Apache-2.0",
+         "dependencies": []},
+    ],
+}
+
+
+def upload_multi(policy="copyleft"):
+    return client.post(
+        "/api/projects",
+        files={"file": ("m.json", json.dumps(MULTI_MANIFEST).encode(), "application/json")},
+        data={"policy_key": policy},
+    )
+
+
+def test_multi_upload_and_overview():
+    res = upload_multi()
+    assert res.status_code == 200, res.text
+    data = res.json()
+    assert data["mode"] == "multi"
+    assert [d["name"] for d in data["distributions"]] == ["gpl3-cli", "gpl2-daemon"]
+    # 悬空根定位到具体制品
+    assert data["dangling_roots"] == [
+        {"distribution": "gpl2-daemon", "ref": "ghost-artifact@3"}]
+    daemon = next(d for d in data["distributions"] if d["name"] == "gpl2-daemon")
+    assert daemon["dangling_roots"] == ["ghost-artifact@3"]
+    # 公共包在两个制品下结论不同
+    cli = next(d for d in data["distributions"] if d["name"] == "gpl3-cli")
+    assert next(p for p in cli["packages"] if p["id"] == "shared@1")["verdict"] == "allow"
+    assert next(p for p in daemon["packages"] if p["id"] == "shared@1")["verdict"] == "deny"
+    # 总览按最严重聚合
+    shared = next(p for p in data["overview"]["packages"] if p["id"] == "shared@1")
+    assert shared["verdict"] == "deny"
+    assert {a["distribution"] for a in shared["affected"]} == {
+        "gpl3-cli", "gpl2-daemon"}
+
+
+def test_multi_exception_requires_distribution():
+    pid = upload_multi().json()["project_id"]
+    # 缺少 distribution
+    r = client.post(f"/api/projects/{pid}/exceptions/shared@1", json={"note": "x"})
+    assert r.status_code == 400
+    # 未知制品
+    r = client.post(f"/api/projects/{pid}/exceptions/shared@1",
+                    json={"note": "x", "distribution": "nope"})
+    assert r.status_code == 400
+    # cli 下 shared 是 allow，不能确认例外
+    r = client.post(f"/api/projects/{pid}/exceptions/shared@1",
+                    json={"note": "x", "distribution": "gpl3-cli"})
+    assert r.status_code == 400
+
+
+def test_multi_exception_saved_with_rule_and_scoped():
+    pid = upload_multi().json()["project_id"]
+    r = client.post(
+        f"/api/projects/{pid}/exceptions/shared@1",
+        json={"note": "专利授权已确认", "distribution": "gpl2-daemon"},
+    )
+    assert r.status_code == 200, r.text
+    data = r.json()
+    daemon = next(d for d in data["distributions"] if d["name"] == "gpl2-daemon")
+    cli = next(d for d in data["distributions"] if d["name"] == "gpl3-cli")
+    sd = next(p for p in daemon["packages"] if p["id"] == "shared@1")
+    sc = next(p for p in cli["packages"] if p["id"] == "shared@1")
+    assert sd["verdict"] == "exception"
+    assert sd["exception"]["rule"] == "MATRIX:GPL-2.0!Apache-2.0"
+    # 只覆盖同规则制品结论：cli 规则不同，仍为 allow
+    assert sc["verdict"] == "allow"
+    assert data["summary"]["conflicts"] == 0
+
+    # 持久化：rule 已入库
+    row = main.db._mem_conn.execute(
+        "SELECT rule, note FROM exceptions WHERE package_id = ?", ("shared@1",)
+    ).fetchone()
+    assert row["rule"] == "MATRIX:GPL-2.0!Apache-2.0"
+    assert row["note"] == "专利授权已确认"
+
+    # 撤销恢复冲突
+    r = client.delete(f"/api/projects/{pid}/exceptions/shared@1")
+    assert r.json()["summary"]["conflicts"] == 1
+
+
+def test_multi_policy_switch_recomputes_per_distribution():
+    pid = upload_multi().json()["project_id"]
+    # 切回 copyleft 无异常；验证 project_license 覆盖被忽略不报错（多制品各带许可证）
+    r = client.post(f"/api/projects/{pid}/reanalyze",
+                    json={"policy_key": "copyleft", "project_license": "MIT"})
+    assert r.status_code == 200
+    assert r.json()["mode"] == "multi"
+
+
+def test_multi_policy_license_mismatch_rejected():
+    # strict 策略不允许 GPL-2.0/GPL-3.0 作为制品许可证
+    res = upload_multi(policy="strict")
+    assert res.status_code == 400
+    # 错误定位到具体制品（按声明顺序先遇到 gpl3-cli）
+    assert "gpl3-cli" in res.json()["detail"]
+
+
+def test_multi_export_contains_distribution_details():
+    pid = upload_multi().json()["project_id"]
+    client.post(
+        f"/api/projects/{pid}/exceptions/shared@1",
+        json={"note": "ok", "distribution": "gpl2-daemon"},
+    )
+    payload = client.get(f"/api/projects/{pid}/export").json()
+    assert payload["mode"] == "multi"
+    assert payload["report_format"] == "licensegate-report/v1"
+    assert {d["name"] for d in payload["distributions"]} == {
+        "gpl3-cli", "gpl2-daemon"}
+    daemon = next(d for d in payload["distributions"] if d["name"] == "gpl2-daemon")
+    assert daemon["dangling_roots"] == ["ghost-artifact@3"]
+    shared_d = next(p for p in daemon["packages"] if p["id"] == "shared@1")
+    assert shared_d["verdict"] == "exception"
+    assert shared_d["shortest_path"] == ["server@1", "shared@1"]
+    ov = next(p for p in payload["overview"]["packages"] if p["id"] == "shared@1")
+    assert len(ov["affected"]) == 2
+    assert payload["exceptions"][0]["rule"] == "MATRIX:GPL-2.0!Apache-2.0"
+    assert payload["dangling_roots"][0]["distribution"] == "gpl2-daemon"
+
+
+def test_multi_direct_analyze_preview():
+    r = client.post("/api/analyze",
+                    json={"manifest": MULTI_MANIFEST, "policy_key": "copyleft"})
+    assert r.status_code == 200
+    data = r.json()
+    assert data["mode"] == "multi"
+    assert data["summary"]["deny"] == 1

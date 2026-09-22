@@ -1,0 +1,56 @@
+{
+  "project": {
+    "name": "example-product-suite",
+    "version": "3.0.0"
+  },
+  "distributions": [
+    {
+      "name": "gpl3-cli",
+      "project_license": "GPL-3.0",
+      "direct_dependencies": ["命令行入口"]
+    },
+    {
+      "name": "gpl2-daemon",
+      "project_license": "GPL-2.0",
+      "direct_dependencies": ["服务入口", "不存在的内部SDK@9.9.9"]
+    }
+  ],
+  "packages": [
+    {
+      "name": "命令行入口",
+      "version": "1.2.0",
+      "license": "GPL-3.0",
+      "dependencies": ["json工具@1.0.0", "共享核心@0.5.0"]
+    },
+    {
+      "name": "服务入口",
+      "version": "2.0.0",
+      "license": "GPL-2.0",
+      "dependencies": ["json工具@1.0.0", "共享核心@0.5.0"]
+    },
+    {
+      "name": "共享核心",
+      "version": "0.5.0",
+      "license": "Apache-2.0",
+      "dependencies": ["json工具@1.0.0"]
+    },
+    {
+      "name": "json工具",
+      "version": "1.0.0",
+      "license": "(MIT OR Apache-2.0)",
+      "dependencies": []
+    },
+    {
+      "name": "日志库",
+      "version": "0.9.2",
+      "license": "BSD-3-Clause",
+      "dependencies": []
+    },
+    {
+      "name": "专有组件",
+      "version": "1.0.0",
+      "license": "Proprietary",
+      "dependencies": []
+    }
+  ]
+}

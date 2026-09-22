@@ -46,12 +46,13 @@
   #fileInfo { font-size:13px; color:var(--green); margin-top:8px; display:none; word-break:break-all; }
   .alert { padding:10px 14px; border-radius:8px; font-size:13px; margin-bottom:16px; display:none; }
   .alert.error { display:block; background:var(--red-bg); color:var(--red); border:1px solid #fecaca; }
-  .stats { display:grid; grid-template-columns:repeat(6,1fr); gap:12px; margin-bottom:20px; }
+  .stats { display:grid; grid-template-columns:repeat(auto-fit,minmax(110px,1fr)); gap:12px; margin-bottom:0; }
   .stat { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:14px; text-align:center; }
   .stat .num { font-size:26px; font-weight:700; }
   .stat .lbl { font-size:12px; color:var(--muted); margin-top:2px; }
   .stat.allow .num { color:var(--green); } .stat.deny .num { color:var(--red); }
   .stat.review .num { color:var(--amber); } .stat.exc .num { color:var(--violet); }
+  .stat.unreach .num { color:var(--muted); }
   table { width:100%; border-collapse:collapse; font-size:13px; }
   th, td { text-align:left; padding:9px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
   th { background:var(--gray-bg); font-size:12px; color:#374151; position:sticky; top:0; }
@@ -87,7 +88,23 @@
   .section-title { display:flex; align-items:center; gap:8px; margin:0 0 12px; font-size:16px; }
   .section-title .count { background:var(--red-bg); color:var(--red); border-radius:999px;
     font-size:12px; padding:1px 9px; font-weight:700; }
-  @media (max-width:820px){ .stats{grid-template-columns:repeat(3,1fr)} .field{min-width:140px} }
+  /* 多制品切换 */
+  .tabs { display:flex; gap:8px; flex-wrap:wrap; }
+  .tab { border:1px solid var(--line); background:#fff; color:var(--ink); border-radius:999px;
+    padding:7px 16px; font-size:13px; font-weight:600; }
+  .tab:hover { background:#eff6ff; }
+  .tab.active { background:var(--brand); border-color:var(--brand); color:#fff; }
+  .tab .dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:6px; }
+  .dot.deny { background:var(--red); } .dot.review { background:var(--amber); }
+  .dot.allow { background:var(--green); } .dot.exception { background:var(--violet); }
+  .tab.active .dot.allow { background:#a7f3d0; } .tab.active .dot.deny { background:#fecaca; }
+  .tab.active .dot.review { background:#fde68a; } .tab.active .dot.exception { background:#ddd6fe; }
+  .scope-meta { font-size:12px; color:var(--muted); margin-bottom:12px; }
+  .affected { border:1px solid var(--line); border-radius:8px; padding:8px 10px; margin-top:8px; }
+  .affected + .affected { margin-top:8px; }
+  .affected .dist-name { font-weight:600; font-size:12px; }
+  .mini-verdicts { display:flex; gap:6px; flex-wrap:wrap; }
+  .mini-verdicts .badge { font-size:11px; padding:1px 7px; }
 </style>
 </head>
 <body>
@@ -107,7 +124,8 @@
         <label>清单 JSON 文件</label>
         <div id="drop" class="drop">
           点击选择文件，或把 JSON 文件拖拽到此处<br>
-          <span class="hint">需包含 <strong>packages[].name / version / license / dependencies</strong></span>
+          <span class="hint">需包含 <strong>packages[].name / version / license / dependencies</strong>；
+          多制品可提供 <strong>distributions</strong></span>
         </div>
         <input id="file" type="file" accept=".json,application/json" class="hidden">
         <div id="fileInfo"></div>
@@ -120,7 +138,7 @@
       <div class="field">
         <label for="projLic">项目许可证（可选，覆盖策略默认值）</label>
         <select id="projLic"></select>
-        <div class="hint">兼容矩阵将以该许可证为"行"进行判定</div>
+        <div class="hint" id="projLicHint">兼容矩阵将以该许可证为"行"进行判定</div>
       </div>
       <div class="field" style="flex:0 0 auto; min-width:120px">
         <button id="uploadBtn" disabled>开始审查</button>
@@ -142,8 +160,16 @@
       <div class="stats" id="stats"></div>
     </div>
 
-    <div class="card">
-      <h2 class="section-title">2. 冲突清单 <span class="count" id="conflictCount">0</span></h2>
+    <!-- 多制品切换 -->
+    <div class="card hidden" id="scopeBar">
+      <h2>制品切换</h2>
+      <div class="tabs" id="scopeTabs"></div>
+    </div>
+
+    <!-- 单制品 / 单制品视图：冲突清单 -->
+    <div class="card" id="conflictCard">
+      <h2 class="section-title" id="conflictTitle">2. 冲突清单 <span class="count" id="conflictCount">0</span></h2>
+      <div id="conflictScopeMeta" class="scope-meta hidden"></div>
       <div style="overflow-x:auto">
         <table id="conflictTable">
           <thead><tr>
@@ -157,7 +183,24 @@
       <p class="hint" id="noConflict" style="display:none;margin-top:10px">🎉 没有发现许可证冲突。</p>
     </div>
 
-    <div class="card">
+    <!-- 总览视图：跨制品聚合冲突 -->
+    <div class="card hidden" id="overviewConflictCard">
+      <h2 class="section-title">跨制品冲突总览 <span class="count" id="ovConflictCount">0</span>
+        <span class="hint">（按最严重结论聚合，逐一列出受影响制品）</span></h2>
+      <div style="overflow-x:auto">
+        <table id="ovConflictTable">
+          <thead><tr>
+            <th style="width:150px">包 / 版本</th><th style="width:120px">许可证</th>
+            <th>各制品结论 / 触发规则 / 最短依赖路径</th>
+          </tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <p class="hint" id="ovNoConflict" style="display:none;margin-top:10px">🎉 所有制品均未发现许可证冲突。</p>
+    </div>
+
+    <!-- 单制品 / 单制品视图：全部依赖明细 -->
+    <div class="card" id="detailCard">
       <details>
         <summary class="section-title" style="display:inline-flex">3. 全部依赖明细（<span id="pkgCount">0</span>）</summary>
         <div style="overflow-x:auto;margin-top:10px">
@@ -170,18 +213,45 @@
         </div>
       </details>
     </div>
+
+    <!-- 总览视图：全部可达包 -->
+    <div class="card hidden" id="overviewDetailCard">
+      <details>
+        <summary class="section-title" style="display:inline-flex">所有制品可达包总览（<span id="ovPkgCount">0</span>）</summary>
+        <div style="overflow-x:auto;margin-top:10px">
+          <table id="ovPkgTable">
+            <thead><tr>
+              <th>包</th><th>许可证</th><th>家族</th><th>制品数</th><th>最严重结论</th><th>各制品结论</th>
+            </tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </details>
+    </div>
+
+    <!-- 总览视图：不可达包 -->
+    <div class="card hidden" id="unreachableCard">
+      <h2 class="section-title">从任何制品根均不可达的包 <span class="count" id="unreachCount"
+        style="background:var(--gray-bg);color:var(--muted)">0</span></h2>
+      <p class="hint">这些包出现在 packages 中但没有任何制品（直接或传递）依赖它们，
+        常见于孤立环或清单冗余；多制品模式下不参与任何制品的统计与判定。</p>
+      <div id="unreachList" class="chips" style="margin-top:10px"></div>
+    </div>
   </div>
 </div>
 
 <script>
 const $ = (s) => document.querySelector(s);
 const VERDICT_TEXT = {allow:"兼容", deny:"冲突", review:"待审查", exception:"例外"};
-let policies = [], currentResult = null, selectedFile = null, currentProjectId = null;
+const OVERVIEW_SCOPE = "__overview__";
+let policies = [], currentResult = null, selectedFile = null,
+    currentProjectId = null, currentScope = OVERVIEW_SCOPE;
 
 function showError(msg){ const a=$("#alert"); a.textContent="⚠️ "+msg; a.className="alert error"; }
 function clearError(){ $("#alert").className="alert"; }
 function esc(s){ return String(s??"").replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 function badge(v){ return `<span class="badge ${v}">${VERDICT_TEXT[v]||v}</span>`; }
+function isMulti(data){ return data.mode === "multi"; }
 
 async function api(path, opts){
   const res = await fetch(path, opts);
@@ -253,6 +323,7 @@ $("#uploadBtn").addEventListener("click", async ()=>{
     const data = await api("/api/projects", {method:"POST", body:fd});
     currentProjectId = data.project_id;
     currentResult = data;
+    currentScope = OVERVIEW_SCOPE;
     render(data);
     loadHistory();
   } catch(e){ showError(e.message); }
@@ -265,6 +336,7 @@ async function loadProject(id){
     const data = await api(`/api/projects/${id}`);
     currentProjectId = data.project_id;
     currentResult = data;
+    currentScope = OVERVIEW_SCOPE;
     $("#policy").value = data.policy_key;
     $("#policy").dispatchEvent(new Event("change"));
     $("#projLic").value = "";
@@ -277,12 +349,12 @@ $("#reanalyzeBtn").addEventListener("click", async ()=>{
   if(!currentProjectId) return;
   clearError();
   try {
+    const body = { policy_key: $("#policy").value };
+    // 多制品清单的项目许可证由各制品自带，顶层覆盖不适用
+    if(!isMulti(currentResult) && $("#projLic").value) body.project_license = $("#projLic").value;
     const data = await api(`/api/projects/${currentProjectId}/reanalyze`, {
       method:"POST", headers:{"Content-Type":"application/json"},
-      body: JSON.stringify({
-        policy_key: $("#policy").value,
-        project_license: $("#projLic").value || null
-      })
+      body: JSON.stringify(body)
     });
     currentResult = data;
     render(data);
@@ -290,11 +362,13 @@ $("#reanalyzeBtn").addEventListener("click", async ()=>{
 });
 
 // ---------- 例外 ----------
-async function approveException(pkgId){
-  const note = $(`#note-${CSS.escape(pkgId)}`).value;
+async function approveException(pkgId, distName){
+  const noteEl = $(`#note-${CSS.escape(pkgId)}${distName?("--"+CSS.escape(distName)):""}`);
+  const note = noteEl ? noteEl.value : "";
   try {
     const data = await api(`/api/projects/${currentProjectId}/exceptions/${encodeURIComponent(pkgId)}`,
-      {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({note})});
+      {method:"POST", headers:{"Content-Type":"application/json"},
+       body:JSON.stringify({note, distribution: distName || null})});
     currentResult = data; render(data);
   } catch(e){ showError(e.message); }
 }
@@ -311,7 +385,7 @@ $("#exportBtn").addEventListener("click", ()=>{
   if(currentProjectId) window.open(`/api/projects/${currentProjectId}/export`, "_blank");
 });
 
-// ---------- 渲染 ----------
+// ---------- 渲染辅助 ----------
 function renderPath(path){
   if(!path || !path.length) return '<span class="hint">（从根不可达，可能位于孤立环中）</span>';
   return path.map((p,i)=> i===path.length-1
@@ -319,58 +393,182 @@ function renderPath(path){
     : `${esc(p)} →`).join(" ");
 }
 
+function pkgCell(p){
+  return `<td><strong>${esc(p.name)}</strong><div class="hint mono">${esc(p.version)}</div>
+    ${p.direct?'<span class="hint">（直接依赖）</span>':''}</td>
+  <td><span class="lic-tag">${esc(p.license_raw||"未声明")}</span>
+    ${p.license!==p.license_raw && p.license!=="NOASSERTION"?`<div class="hint">规范化：${esc(p.license)}</div>`:""}
+    ${p.license==="NOASSERTION"?'<div class="hint">⚠ 无法识别</div>':''}</td>`;
+}
+
+// 单个制品视角下一个冲突包的"例外操作"单元格
+function exceptionCell(p, distName){
+  const suffix = distName ? `--${esc(distName)}` : "";
+  if(p.exception) return `
+    <div class="badge exception">已确认例外</div>
+    ${p.exception.note ? `<div class="exc-note">理由：${esc(p.exception.note)}</div>`:""}
+    <div class="msg">原结论：${VERDICT_TEXT[p.base_verdict]} · ${esc(p.exception.approved_at||"")}</div>
+    <button class="danger" style="margin-top:6px" onclick="revokeException('${esc(p.id)}')">撤销例外</button>`;
+  return `
+    <div class="exc-box">
+      <textarea id="note-${esc(p.id)}${suffix}" placeholder="确认例外的理由（可选），如：仅内部使用不对外分发，已获法务审批……"></textarea>
+      <button onclick="approveException('${esc(p.id)}'${distName?`, '${esc(distName)}'`:""})">确认例外</button>
+    </div>`;
+}
+
+function verdictBody(p){
+  return `${badge(p.verdict)}
+    <div class="rule" style="margin-top:5px">触发规则：<code>${esc(p.rule)}</code></div>
+    <div class="msg">${esc(p.message)}</div>
+    <details><summary>最短依赖路径（深度 ${p.depth??"—"}）</summary>
+      <div class="path mono" style="margin-top:5px">${renderPath(p.shortest_path)}</div>
+    </details>`;
+}
+
+function statCards(items){
+  return items.map(([n,l,c])=>
+    `<div class="stat ${c||""}"><div class="num">${n}</div><div class="lbl">${l}</div></div>`).join("");
+}
+
+// ---------- 总渲染 ----------
 function render(data){
   $("#results").classList.remove("hidden");
+  renderHeader(data);
+  if(isMulti(data)) renderMulti(data);
+  else renderSingle(data);
+}function renderHeader(data){
   const s = data.summary;
-  $("#projTitle").innerHTML = `${esc(data.project.name)} <span>${esc(data.project.version||"")} · 项目许可证 ${esc(data.project_license)} · 策略：${esc(data.policy.name)}</span>`;
+  const modeLabel = isMulti(data)
+    ? `多制品（${data.distributions.length} 个分发物） · 策略：${esc(data.policy.name)}`
+    : `项目许可证 ${esc(data.project_license)} · 策略：${esc(data.policy.name)}`;
+  $("#projTitle").innerHTML =
+    `${esc(data.project.name)} <span>${esc(data.project.version||"")} · ${modeLabel}</span>`;
 
   const chips = [];
   if(data.cycles.length) chips.push(`<span class="chip err">检测到 ${data.cycles.length} 个循环依赖</span>`);
-  if(data.unresolved_refs.length) chips.push(`<span class="chip warn">${data.unresolved_refs.length} 个依赖引用无法解析：${esc(data.unresolved_refs.slice(0,5).join(", "))}${data.unresolved_refs.length>5?" …":""}</span>`);
-  if(!chips.length) chips.push('<span class="chip">依赖图解析正常，无循环 / 悬空引用</span>');
+  if(isMulti(data)){
+    for(const d of (data.dangling_roots||[]))
+      chips.push(`<span class="chip err">制品「${esc(d.distribution)}」存在悬空根：<span class="mono">${esc(d.ref)}</span>（引用的包不在清单中）</span>`);
+    if(s.unreachable)
+      chips.push(`<span class="chip warn">${s.unreachable} 个包从任何制品根均不可达，不计入任何制品</span>`);
+    const other = (data.unresolved_refs||[]).filter(r =>
+      !(data.dangling_roots||[]).some(d => d.ref === r));
+    if(other.length)
+      chips.push(`<span class="chip warn">${other.length} 个依赖引用无法解析：${esc(other.slice(0,5).join(", "))}${other.length>5?" …":""}</span>`);
+    if(!chips.length) chips.push('<span class="chip">依赖图解析正常，无循环 / 悬空引用</span>');
+    $("#projLic").disabled = true;
+    $("#projLicHint").textContent = "多制品清单：每个制品使用各自的项目许可证，此选择不生效";
+  } else {
+    if(data.unresolved_refs.length)
+      chips.push(`<span class="chip warn">${data.unresolved_refs.length} 个依赖引用无法解析：${esc(data.unresolved_refs.slice(0,5).join(", "))}${data.unresolved_refs.length>5?" …":""}</span>`);
+    if(!chips.length) chips.push('<span class="chip">依赖图解析正常，无循环 / 悬空引用</span>');
+    $("#projLic").disabled = false;
+    $("#projLicHint").textContent = '兼容矩阵将以该许可证为"行"进行判定';
+  }
   $("#chips").innerHTML = chips.join("");
+}
 
-  $("#stats").innerHTML = [
+function renderOverviewStats(data){
+  const s = data.summary;
+  $("#stats").innerHTML = statCards([
+    [s.total,"可达包（去重）",""],[s.deny,"冲突","deny"],[s.review,"待审查","review"],
+    [s.allow,"兼容","allow"],[s.exceptions,"已确认例外","exc"],
+    [s.conflicts,"未处理问题",""],[s.unreachable||0,"不可达","unreach"],
+  ]);
+}
+
+// ---------- 单制品 ----------
+function renderSingle(data){
+  $("#scopeBar").classList.add("hidden");
+  $("#overviewConflictCard").classList.add("hidden");
+  $("#overviewDetailCard").classList.add("hidden");
+  $("#unreachableCard").classList.add("hidden");
+  $("#conflictCard").classList.remove("hidden");
+  $("#detailCard").classList.remove("hidden");
+  $("#conflictScopeMeta").classList.add("hidden");
+
+  const s = data.summary;
+  $("#stats").innerHTML = statCards([
     [s.total,"依赖总数",""],[s.deny,"冲突","deny"],[s.review,"待审查","review"],
     [s.allow,"兼容","allow"],[s.exceptions,"已确认例外","exc"],
-    [s.conflicts,"未处理问题",""]
-  ].map(([n,l,c])=>`<div class="stat ${c}"><div class="num">${n}</div><div class="lbl">${l}</div></div>`).join("");
+    [s.conflicts,"未处理问题",""],
+  ]);
 
-  // 冲突表
-  const tbody = $("#conflictTable tbody");
   const conflicts = data.conflicts || [];
-  $("#conflictCount").textContent = conflicts.length;
+  $("#conflictTitle").innerHTML = '2. 冲突清单 <span class="count" id="conflictCount">'+conflicts.length+'</span>';
   $("#noConflict").style.display = conflicts.length ? "none" : "block";
-  tbody.innerHTML = conflicts.map(p=>{
-    const excCell = p.exception ? `
-      <div class="badge exception">已确认例外</div>
-      ${p.exception.note ? `<div class="exc-note">理由：${esc(p.exception.note)}</div>`:""}
-      <div class="msg">原结论：${VERDICT_TEXT[p.base_verdict]} · ${esc(p.exception.approved_at)}</div>
-      <button class="danger" style="margin-top:6px" onclick="revokeException('${esc(p.id)}')">撤销例外</button>` : `
-      <div class="exc-box">
-        <textarea id="note-${esc(p.id)}" placeholder="确认例外的理由（可选），如：仅内部使用不对外分发，已获法务审批……"></textarea>
-        <button onclick="approveException('${esc(p.id)}')">确认例外</button>
-      </div>`;
-    return `<tr>
-      <td><strong>${esc(p.name)}</strong><div class="hint mono">${esc(p.version)}</div>
-        ${p.direct?'<span class="hint">（直接依赖）</span>':''}</td>
-      <td><span class="lic-tag">${esc(p.license_raw||"未声明")}</span>
-        ${p.license!==p.license_raw && p.license!=="NOASSERTION"?`<div class="hint">规范化：${esc(p.license)}</div>`:""}
-        ${p.license==="NOASSERTION"?'<div class="hint">⚠ 无法识别</div>':''}</td>
-      <td>${badge(p.verdict)}
-        <div class="rule" style="margin-top:5px">触发规则：<code>${esc(p.rule)}</code></div>
-        <div class="msg">${esc(p.message)}</div>
-        <details><summary>最短依赖路径（深度 ${p.depth??"—"}）</summary>
-          <div class="path mono" style="margin-top:5px">${renderPath(p.shortest_path)}</div>
-        </details>
-      </td>
-      <td>${excCell}</td>
-    </tr>`;
-  }).join("");
+  $("#conflictTable tbody").innerHTML = conflicts.map(p=>`<tr>
+    ${pkgCell(p)}<td>${verdictBody(p)}</td><td>${exceptionCell(p, null)}</td>
+  </tr>`).join("");
 
-  // 全量明细表
-  $("#pkgCount").textContent = s.total;
+  $("#pkgCount").textContent = data.summary.total;
   $("#pkgTable tbody").innerHTML = data.packages.map(p=>`<tr>
+    <td class="mono">${esc(p.id)}${p.direct?' <span class="hint">[直接]</span>':''}
+      ${p.reachable?'':'<span class="hint">[不可达]</span>'}</td>
+    <td><span class="lic-tag">${esc(p.license_raw||"未声明")}</span></td>
+    <td>${esc(p.family)}</td>
+    <td>${p.depth??"不可达"}</td>
+    <td>${badge(p.verdict)}</td>
+    <td class="mono" style="color:var(--muted)">${esc(p.rule)}</td>
+  </tr>`).join("");
+}
+
+// ---------- 多制品 ----------
+function renderMulti(data){
+  $("#scopeBar").classList.remove("hidden");
+  // tabs：总览 + 各制品（带最严重结论圆点）
+  const tabDot = (verdict) =>
+    verdict ? `<span class="dot ${verdict}"></span>` : "";
+  const tabs = [{key: OVERVIEW_SCOPE, label: "总览", verdict:
+      data.summary.conflicts ? (data.summary.deny ? "deny" : "review")
+      : (data.summary.exceptions ? "exception" : "allow")}]
+    .concat(data.distributions.map(d => ({
+      key: d.name, label: d.name,
+      verdict: d.summary.conflicts ? (d.summary.deny ? "deny" : "review")
+        : (d.summary.exceptions ? "exception" : "allow"),
+    })));
+  if(!tabs.some(t=>t.key===currentScope)) currentScope = OVERVIEW_SCOPE;
+  $("#scopeTabs").innerHTML = tabs.map(t=>
+    `<button class="tab ${t.key===currentScope?"active":""}" data-scope="${esc(t.key)}">
+      ${tabDot(t.verdict)}${esc(t.label)}</button>`).join("");
+  $("#scopeTabs").querySelectorAll(".tab").forEach(b=>
+    b.addEventListener("click", ()=>{ currentScope = b.dataset.scope; renderMulti(data); }));
+
+  if(currentScope === OVERVIEW_SCOPE) renderOverview(data);
+  else renderScope(data, currentScope);
+}
+
+function renderScope(data, scopeName){
+  const d = data.distributions.find(x=>x.name===scopeName);
+  $("#overviewConflictCard").classList.add("hidden");
+  $("#overviewDetailCard").classList.add("hidden");
+  $("#unreachableCard").classList.add("hidden");
+  $("#conflictCard").classList.remove("hidden");
+  $("#detailCard").classList.remove("hidden");
+
+  const meta = $("#conflictScopeMeta");
+  meta.classList.remove("hidden");
+  const dangling = (d.dangling_roots||[]);
+  meta.innerHTML = `制品 <strong>${esc(d.name)}</strong> · 项目许可证 <span class="lic-tag">${esc(d.project_license)}</span>
+    · 根：${d.roots.length ? d.roots.map(r=>`<span class="mono">${esc(r)}</span>`).join("、") : "（无）"}
+    · 只统计该制品可达的 ${d.summary.total} 个包` +
+    (dangling.length ? ` · <span style="color:var(--red)">悬空根：${dangling.map(r=>`<span class="mono">${esc(r)}</span>`).join("、")}</span>` : "");
+
+  $("#stats").innerHTML = statCards([
+    [d.summary.total,"本制品可达包",""],[d.summary.deny,"冲突","deny"],
+    [d.summary.review,"待审查","review"],[d.summary.allow,"兼容","allow"],
+    [d.summary.exceptions,"已确认例外","exc"],[d.summary.conflicts,"未处理问题",""],
+  ]);
+
+  $("#conflictTitle").innerHTML =
+    `制品「${esc(d.name)}」的冲突清单 <span class="count">${d.conflicts.length}</span>`;
+  $("#noConflict").style.display = d.conflicts.length ? "none" : "block";
+  $("#conflictTable tbody").innerHTML = d.conflicts.map(p=>`<tr>
+    ${pkgCell(p)}<td>${verdictBody(p)}</td><td>${exceptionCell(p, d.name)}</td>
+  </tr>`).join("");
+
+  $("#pkgCount").textContent = d.summary.total;
+  $("#pkgTable tbody").innerHTML = d.packages.map(p=>`<tr>
     <td class="mono">${esc(p.id)}${p.direct?' <span class="hint">[直接]</span>':''}</td>
     <td><span class="lic-tag">${esc(p.license_raw||"未声明")}</span></td>
     <td>${esc(p.family)}</td>
@@ -378,6 +576,79 @@ function render(data){
     <td>${badge(p.verdict)}</td>
     <td class="mono" style="color:var(--muted)">${esc(p.rule)}</td>
   </tr>`).join("");
+}
+
+function renderOverview(data){
+  $("#conflictCard").classList.add("hidden");
+  $("#detailCard").classList.add("hidden");
+  $("#overviewConflictCard").classList.remove("hidden");
+  $("#overviewDetailCard").classList.remove("hidden");
+  renderOverviewStats(data);
+
+  const ov = data.overview;
+  const conflicts = ov.conflicts;
+  $("#ovConflictCount").textContent = conflicts.length;
+  $("#ovNoConflict").style.display = conflicts.length ? "none" : "block";
+
+  $("#ovConflictTable tbody").innerHTML = conflicts.map(p=>{
+    const affected = p.affected.map(a=>{
+      const suffix = `--${esc(a.distribution)}`;
+      let action;
+      if(a.verdict === "exception"){
+        action = `<div class="badge exception">已确认例外</div>
+          ${a.exception?.note ? `<div class="exc-note">理由：${esc(a.exception.note)}</div>`:""}
+          <button class="danger" style="margin-top:5px" onclick="revokeException('${esc(p.id)}')">撤销例外</button>`;
+      } else if(a.verdict === "allow"){
+        action = `<span class="hint">兼容，无需例外</span>`;
+      } else {
+        action = `<div class="exc-box">
+          <textarea id="note-${esc(p.id)}${suffix}" placeholder="确认例外的理由（可选）……"></textarea>
+          <button onclick="approveException('${esc(p.id)}', '${esc(a.distribution)}')">
+            仅对制品「${esc(a.distribution)}」确认例外</button>
+          <div class="msg">将保存该制品下的触发规则，只覆盖同包同规则的制品结论</div>
+        </div>`;
+      }
+      return `<div class="affected">
+        <div class="dist-name">制品「${esc(a.distribution)}」 ${badge(a.verdict)}
+          ${a.direct?'<span class="hint">（直接依赖）</span>':`<span class="hint">深度 ${a.depth??"—"}</span>`}</div>
+        <div class="rule" style="margin-top:3px">触发规则：<code>${esc(a.rule)}</code></div>
+        <div class="msg">${esc(a.message)}</div>
+        <details><summary>该制品下的最短依赖路径</summary>
+          <div class="path mono" style="margin-top:5px">${renderPath(a.shortest_path)}</div>
+        </details>
+        ${action}
+      </div>`;
+    }).join("");
+    return `<tr>
+      ${pkgCell(p)}
+      <td>${badge(p.verdict)} <span class="hint">最严重结论（跨 ${p.affected_count} 个制品）</span>
+        <div style="margin-top:8px">${affected}</div></td>
+    </tr>`;
+  }).join("");
+
+  // 所有可达包明细
+  $("#ovPkgCount").textContent = ov.packages.length;
+  $("#ovPkgTable tbody").innerHTML = ov.packages.map(p=>`<tr>
+    <td class="mono">${esc(p.id)}</td>
+    <td><span class="lic-tag">${esc(p.license_raw||"未声明")}</span></td>
+    <td>${esc(p.family)}</td>
+    <td>${p.affected_count}</td>
+    <td>${badge(p.verdict)}</td>
+    <td><div class="mini-verdicts">${p.affected.map(a=>
+      `<span class="badge ${a.verdict}" title="${esc(a.rule)}">${esc(a.distribution)}:${VERDICT_TEXT[a.verdict]||a.verdict}</span>`
+    ).join("")}</div></td>
+  </tr>`).join("");
+
+  // 不可达包
+  const unreached = ov.unreachable_packages || [];
+  const card = $("#unreachableCard");
+  if(unreached.length){
+    card.classList.remove("hidden");
+    $("#unreachCount").textContent = unreached.length;
+    $("#unreachList").innerHTML = unreached.map(p=>
+      `<span class="chip"><span class="mono">${esc(p.id)}</span> · ${esc(p.license_raw||"未声明")}</span>`
+    ).join("");
+  } else card.classList.add("hidden");
 }
 
 window.approveException = approveException;

@@ -25,12 +25,18 @@ CREATE TABLE IF NOT EXISTS exceptions (
     project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
     package_id TEXT NOT NULL,
     note TEXT DEFAULT '',
+    rule TEXT,
     approved_at TEXT NOT NULL,
     UNIQUE(project_id, package_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_exceptions_project ON exceptions(project_id);
 """
+
+#: 旧库（建表时没有 rule 列）平滑升级
+_MIGRATIONS = (
+    "ALTER TABLE exceptions ADD COLUMN rule TEXT",
+)
 
 
 def now_iso() -> str:
@@ -78,6 +84,11 @@ class Database:
             self._mem_conn.execute("PRAGMA foreign_keys = ON")
         with self.connect() as conn:
             conn.executescript(SCHEMA)
+            for stmt in _MIGRATIONS:
+                try:
+                    conn.execute(stmt)
+                except sqlite3.OperationalError:
+                    pass  # 列已存在（全新库按 SCHEMA 直接建好）
             if self.path != ":memory:":
                 conn.execute("PRAGMA journal_mode=WAL")
 
@@ -132,23 +143,29 @@ class Database:
     def list_exceptions(self, project_id: int) -> dict[str, dict]:
         with self.connect() as conn:
             rows = conn.execute(
-                "SELECT package_id, note, approved_at FROM exceptions "
+                "SELECT package_id, note, rule, approved_at FROM exceptions "
                 "WHERE project_id = ? ORDER BY approved_at",
                 (project_id,),
             ).fetchall()
         return {
-            r["package_id"]: {"note": r["note"], "approved_at": r["approved_at"]}
+            r["package_id"]: {
+                "note": r["note"],
+                "rule": r["rule"],
+                "approved_at": r["approved_at"],
+            }
             for r in rows
         }
 
-    def add_exception(self, project_id: int, package_id: str, note: str) -> dict:
+    def add_exception(self, project_id: int, package_id: str, note: str,
+                      rule: Optional[str] = None) -> dict:
         ts = now_iso()
         with self.connect() as conn:
             conn.execute(
-                "INSERT INTO exceptions(project_id, package_id, note, approved_at) "
-                "VALUES (?,?,?,?) ON CONFLICT(project_id, package_id) "
-                "DO UPDATE SET note=excluded.note, approved_at=excluded.approved_at",
-                (project_id, package_id, note, ts),
+                "INSERT INTO exceptions(project_id, package_id, note, rule, approved_at) "
+                "VALUES (?,?,?,?,?) ON CONFLICT(project_id, package_id) "
+                "DO UPDATE SET note=excluded.note, rule=excluded.rule, "
+                "approved_at=excluded.approved_at",
+                (project_id, package_id, note, rule, ts),
             )
             conn.execute(
                 "UPDATE projects SET updated_at = ? WHERE id = ?", (ts, project_id)

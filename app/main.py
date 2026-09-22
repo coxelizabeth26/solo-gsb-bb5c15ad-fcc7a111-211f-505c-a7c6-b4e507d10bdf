@@ -45,6 +45,10 @@ class ReanalyzeRequest(BaseModel):
 
 class ExceptionRequest(BaseModel):
     note: str = Field(default="", max_length=2000, description="例外理由 / 审批备注")
+    distribution: Optional[str] = Field(
+        default=None,
+        description="多制品清单：在哪个制品下确认例外（用于定位触发规则）",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -155,7 +159,9 @@ async def create_project(
         policy_key=policy.key,
         manifest=manifest,
     )
-    return _analyze_project(project_id, policy, chosen_license)
+    # 多制品清单的许可证由各制品自带，不再传顶层 override
+    effective_override = None if preview.get("mode") == analyzer.MODE_MULTI else chosen_license
+    return _analyze_project(project_id, policy, effective_override)
 
 
 @app.get("/api/projects")
@@ -196,8 +202,49 @@ def add_exception(project_id: int, package_id: str, req: ExceptionRequest) -> di
     if package_id not in pkg_keys:
         raise HTTPException(status_code=404, detail=f"包 {package_id} 不在清单中")
 
-    entry = db.add_exception(project_id, package_id, req.note.strip())
     policy = _resolve_policy(project["policy_key"])
+
+    # 先在当前策略下计算一次，定位"所选制品下该包"的触发规则
+    try:
+        preview = analyzer.analyze(
+            project["manifest"], policy, None, db.list_exceptions(project_id)
+        )
+    except analyzer.ManifestError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    rule: Optional[str] = None
+    if preview.get("mode") == analyzer.MODE_MULTI:
+        dist_name = (req.distribution or "").strip()
+        if not dist_name:
+            raise HTTPException(
+                status_code=400,
+                detail="多制品清单确认例外时必须指定 distribution（制品名称）",
+            )
+        scope = next(
+            (d for d in preview["distributions"] if d["name"] == dist_name), None
+        )
+        if scope is None:
+            names = ", ".join(d["name"] for d in preview["distributions"])
+            raise HTTPException(
+                status_code=400,
+                detail=f"制品 {dist_name!r} 不存在，可选制品：{names}",
+            )
+        hit = next((p for p in scope["packages"] if p["id"] == package_id), None)
+        if hit is None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"包 {package_id} 从制品「{dist_name}」的根不可达，"
+                "无法在该制品下确认例外",
+            )
+        if hit["base_verdict"] not in ("deny", "review") or hit["exception"]:
+            raise HTTPException(
+                status_code=400,
+                detail=f"包 {package_id} 在制品「{dist_name}」下结论为 "
+                f"{hit['base_verdict']}，不存在需要例外的冲突",
+            )
+        rule = hit["rule"]
+
+    db.add_exception(project_id, package_id, req.note.strip(), rule)
     return _analyze_project(project_id, policy, None)
 
 
@@ -231,6 +278,7 @@ def export_project(project_id: int) -> JSONResponse:
     export_payload = {
         "report_format": "licensegate-report/v1",
         "exported_at": now_iso(),
+        "mode": result.get("mode", "single"),
         "project": {
             "id": project["id"],
             "name": project["name"],
@@ -242,39 +290,11 @@ def export_project(project_id: int) -> JSONResponse:
             "name": policy.name,
         },
         "summary": result["summary"],
-        "packages": [
-            {
-                "id": p["id"],
-                "name": p["name"],
-                "version": p["version"],
-                "license": p["license_raw"],
-                "license_canonical": p["license"],
-                "family": p["family"],
-                "direct": p["direct"],
-                "verdict": p["verdict"],
-                "base_verdict": p["base_verdict"],
-                "rule": p["rule"],
-                "message": p["message"],
-                "shortest_path": p["shortest_path"],
-                "exception": p["exception"],
-            }
-            for p in result["packages"]
-        ],
-        "conflicts": [
-            {
-                "package": c["id"],
-                "license": c["license_raw"],
-                "severity": c["severity"],
-                "rule": c["rule"],
-                "message": c["message"],
-                "shortest_path": c["shortest_path"],
-            }
-            for c in result["conflicts"]
-        ],
         "exceptions": [
             {
                 "package_id": pid,
                 "note": info["note"],
+                "rule": info.get("rule"),
                 "approved_at": info["approved_at"],
             }
             for pid, info in db.list_exceptions(project_id).items()
@@ -283,6 +303,81 @@ def export_project(project_id: int) -> JSONResponse:
         "unresolved_refs": result["unresolved_refs"],
         "manifest": project["manifest"],
     }
+
+    def pkg_entry(p: dict) -> dict:
+        return {
+            "id": p["id"],
+            "name": p["name"],
+            "version": p["version"],
+            "license": p["license_raw"],
+            "license_canonical": p["license"],
+            "family": p["family"],
+            "direct": p.get("direct"),
+            "depth": p.get("depth"),
+            "verdict": p["verdict"],
+            "base_verdict": p["base_verdict"],
+            "rule": p["rule"],
+            "message": p["message"],
+            "shortest_path": p.get("shortest_path", []),
+            "exception": p.get("exception"),
+        }
+
+    def conflict_entry(c: dict) -> dict:
+        return {
+            "package": c["id"],
+            "license": c["license_raw"],
+            "severity": c["severity"],
+            "rule": c["rule"],
+            "message": c["message"],
+            "shortest_path": c["shortest_path"],
+        }
+
+    if result.get("mode") == analyzer.MODE_MULTI:
+        # 分制品明细：每个制品保留各自可达包的独立路径 / 结论 / 触发规则
+        export_payload["distributions"] = [
+            {
+                "name": d["name"],
+                "project_license": d["project_license"],
+                "roots": d["roots"],
+                "dangling_roots": d.get("dangling_roots", []),
+                "summary": d["summary"],
+                "packages": [pkg_entry(p) for p in d["packages"]],
+                "conflicts": [conflict_entry(c) for c in d["conflicts"]],
+            }
+            for d in result["distributions"]
+        ]
+        # 总览：按最严重结论聚合，列出受影响制品
+        export_payload["overview"] = {
+            "summary": result["overview"]["summary"],
+            "packages": [
+                {
+                    **pkg_entry(p),
+                    "affected_count": p["affected_count"],
+                    "affected": p["affected"],
+                }
+                for p in result["overview"]["packages"]
+            ],
+            "conflicts": [
+                {
+                    "package": c["id"],
+                    "license": c["license_raw"],
+                    "severity": c["severity"],
+                    "rule": c["rule"],
+                    "verdict": c["verdict"],
+                    "message": c["message"],
+                    "affected": c["affected"],
+                }
+                for c in result["overview"]["conflicts"]
+            ],
+            "unreachable_packages": result["overview"]["unreachable_packages"],
+        }
+        export_payload["dangling_roots"] = result["dangling_roots"]
+    else:
+        export_payload["packages"] = [pkg_entry(p) for p in result["packages"]]
+        export_payload["conflicts"] = [
+            conflict_entry(c) for c in result["conflicts"]
+        ]
+
     filename = f"license-report-{project_id}.json"
     return JSONResponse(
         content=export_payload,
